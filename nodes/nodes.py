@@ -3142,7 +3142,7 @@ class WanImageToVideoSVIPro(io.ComfyNode):
 
         # Blend end_frame_latent into the last frames of anchor_samples if provided
         if end_frame_latent is not None:
-            end_latent = end_frame_latent["samples"].clone()
+            end_latent = end_frame_latent["samples"]
             end_frames = end_latent.shape[2]
             num_anchor = anchor_latent.shape[2]
 
@@ -3155,10 +3155,7 @@ class WanImageToVideoSVIPro(io.ComfyNode):
                 if anchor_frame_idx < num_anchor:
                     # Blend factor increases from 0 to 1 as we go through end frames
                     blend_factor = (frame_idx + 1) / end_frames
-                    anchor_latent[:, :, anchor_frame_idx] = (
-                        (1 - blend_factor) * anchor_latent[:, :, anchor_frame_idx] +
-                        blend_factor * end_latent[:, :, frame_idx]
-                    )
+                    anchor_latent[:, :, anchor_frame_idx] += blend_factor * (end_latent[:, :, frame_idx] - anchor_latent[:, :, anchor_frame_idx])
 
         if prev_samples is None or motion_latent_count == 0:
             padding_size = total_latents - anchor_latent.shape[2]
@@ -3170,30 +3167,27 @@ class WanImageToVideoSVIPro(io.ComfyNode):
 
         padding = torch.zeros(B, C, padding_size, H, W, dtype=dtype, device=device)
 
+        mask = torch.ones((1, 1, empty_latent.shape[2], H, W), device=device, dtype=dtype)
+        mask[:, :, :anchor_latent.shape[2]] = 0.0
+
         # Blend end_frame_latent into the last frames of padding (regardless of anchor blending)
         if end_frame_latent is not None and padding_size > 0:
-            end_latent = end_frame_latent["samples"].clone()
+            end_latent = end_frame_latent["samples"]
             end_frames = end_latent.shape[2]
 
             # Calculate how many padding frames to blend based on end_frame_fill
-            blend_frames = max(1, int(padding_size * end_frame_fill))
-            blend_frames = min(blend_frames, end_frames, padding_size)
+            blend_frames = min(int(padding_size * end_frame_fill), end_frames)
             padding_blend_start = padding_size - blend_frames
 
             for frame_idx in range(blend_frames):
                 padding_frame_idx = padding_blend_start + frame_idx
                 # Blend factor increases from 0 to strength across the blended padding frames
                 blend_factor = ((frame_idx + 1) / blend_frames) * end_frame_max_strength
-                padding[:, :, padding_frame_idx] = (
-                    (1 - blend_factor) * padding[:, :, padding_frame_idx] +
-                    blend_factor * end_latent[:, :, frame_idx]
-                )
+                padding[:, :, padding_frame_idx] = blend_factor * end_latent[:, :, frame_idx]
+                mask[:, :, -blend_frames + frame_idx] = 0.0
 
         padding = comfy.latent_formats.Wan21().process_out(padding)
         image_cond_latent = torch.cat([image_cond_latent, padding], dim=2)
-
-        mask = torch.ones((1, 1, empty_latent.shape[2], H, W), device=device, dtype=dtype)
-        mask[:, :, :anchor_latent.shape[2]] = 0.0
 
         positive = node_helpers.conditioning_set_values(positive, {"concat_latent_image": image_cond_latent, "concat_mask": mask})
         negative = node_helpers.conditioning_set_values(negative, {"concat_latent_image": image_cond_latent, "concat_mask": mask})
