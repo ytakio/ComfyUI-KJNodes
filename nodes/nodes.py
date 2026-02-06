@@ -3131,66 +3131,53 @@ class WanImageToVideoSVIPro(io.ComfyNode):
 
     @classmethod
     def execute(cls, positive, negative, length, motion_latent_count, anchor_samples, end_frame_fill=0.5, end_frame_max_strength=1.0, prev_samples=None, end_frame_latent=None) -> io.NodeOutput:
-        anchor_latent = anchor_samples["samples"].clone()
 
-        B, C, T, H, W = anchor_latent.shape
-        empty_latent = torch.zeros([B, 16, ((length - 1) // 4) + 1, H, W], device=model_management.intermediate_device())
+        latent_total = (length - 1) // 4 + 1
 
-        total_latents = (length - 1) // 4 + 1
+        anchor_latent = anchor_samples["samples"]
         device = anchor_latent.device
         dtype = anchor_latent.dtype
+        batch, ch, anchor_length, height, width = anchor_latent.shape
 
-        # Blend end_frame_latent into the last frames of anchor_samples if provided
+        empty_latent = torch.zeros([batch, ch, latent_total, height, width], device=model_management.intermediate_device())
+
+        # allocate cat concat latent and mask
+        cat_latent = torch.zeros(batch, ch, latent_total, height, width, dtype=dtype, device=device)
+        mask = torch.ones((1, latent_total, 4, height, width), device=device, dtype=dtype)
+        fw_offset = 0
+        bw_offset = latent_total
+
+        # accumulate anchor latents
+        fw_offset += anchor_length
+        cat_latent[:, :, :fw_offset] = anchor_latent
+        mask[:, :fw_offset] = 0.0
+
+        # apply motion latents from prev_samples if provided
+        if prev_samples is not None and  0 < motion_latent_count:
+            motion_latent = prev_samples["samples"][:, :, -motion_latent_count:]
+
+            target = fw_offset + motion_latent_count
+            cat_latent[:, :, fw_offset:target] = motion_latent
+            # mask[:, fw_offset:target] = 0.0
+            fw_offset = target
+
+        # closing with end_frame_latent if provided
         if end_frame_latent is not None:
             end_latent = end_frame_latent["samples"]
-            end_frames = end_latent.shape[2]
-            num_anchor = anchor_latent.shape[2]
+            end_latent_count = end_latent.shape[2]
 
-            # Calculate where to start blending (last N frames of anchor)
-            blend_start_idx = max(0, num_anchor - end_frames)
+            if 0 < end_latent_count:
+                bw_offset -= end_latent_count
+                # latents_mean = comfy.latent_formats.Wan21().latents_mean.to(device=device, dtype=dtype)
+                # cat_latent[:, :, bw_offset:] = end_latent
+                cat_latent[:, :, bw_offset:] = comfy.latent_formats.Wan21().process_out(end_latent)
+                mask[:, bw_offset:] = 0.0
 
-            # Blend the overlapping frames: gradual transition from anchor to end
-            for frame_idx in range(end_frames):
-                anchor_frame_idx = blend_start_idx + frame_idx
-                if anchor_frame_idx < num_anchor:
-                    # Blend factor increases from 0 to 1 as we go through end frames
-                    blend_factor = (frame_idx + 1) / end_frames
-                    anchor_latent[:, :, anchor_frame_idx] += blend_factor * (end_latent[:, :, frame_idx] - anchor_latent[:, :, anchor_frame_idx])
+        cat_latent[:, :, fw_offset:bw_offset] = comfy.latent_formats.Wan21().process_out(cat_latent[:, :, fw_offset:bw_offset])
+        mask = mask.transpose(1, 2)
 
-        if prev_samples is None or motion_latent_count == 0:
-            padding_size = total_latents - anchor_latent.shape[2]
-            image_cond_latent = anchor_latent
-        else:
-            motion_latent = prev_samples["samples"][:, :, -motion_latent_count:].clone()
-            padding_size = total_latents - anchor_latent.shape[2] - motion_latent.shape[2]
-            image_cond_latent = torch.cat([anchor_latent, motion_latent], dim=2)
-
-        padding = torch.zeros(B, C, padding_size, H, W, dtype=dtype, device=device)
-
-        mask = torch.ones((1, 1, empty_latent.shape[2], H, W), device=device, dtype=dtype)
-        mask[:, :, :anchor_latent.shape[2]] = 0.0
-
-        # Blend end_frame_latent into the last frames of padding (regardless of anchor blending)
-        if end_frame_latent is not None and padding_size > 0:
-            end_latent = end_frame_latent["samples"]
-            end_frames = end_latent.shape[2]
-
-            # Calculate how many padding frames to blend based on end_frame_fill
-            blend_frames = min(int(padding_size * end_frame_fill), end_frames)
-            padding_blend_start = padding_size - blend_frames
-
-            for frame_idx in range(blend_frames):
-                padding_frame_idx = padding_blend_start + frame_idx
-                # Blend factor increases from 0 to strength across the blended padding frames
-                blend_factor = ((frame_idx + 1) / blend_frames) * end_frame_max_strength
-                padding[:, :, padding_frame_idx] = blend_factor * end_latent[:, :, frame_idx]
-                mask[:, :, -blend_frames + frame_idx] = 0.0
-
-        padding = comfy.latent_formats.Wan21().process_out(padding)
-        image_cond_latent = torch.cat([image_cond_latent, padding], dim=2)
-
-        positive = node_helpers.conditioning_set_values(positive, {"concat_latent_image": image_cond_latent, "concat_mask": mask})
-        negative = node_helpers.conditioning_set_values(negative, {"concat_latent_image": image_cond_latent, "concat_mask": mask})
+        positive = node_helpers.conditioning_set_values(positive, {"concat_latent_image": cat_latent, "concat_mask": mask})
+        negative = node_helpers.conditioning_set_values(negative, {"concat_latent_image": cat_latent, "concat_mask": mask})
 
         out_latent = {}
         out_latent["samples"] = empty_latent
