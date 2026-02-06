@@ -3118,9 +3118,7 @@ class WanImageToVideoSVIPro(io.ComfyNode):
                 io.Latent.Input("anchor_samples"),
                 io.Latent.Input("prev_samples", optional=True),
                 io.Int.Input("motion_latent_count", default=1, min=0, max=128, step=1),
-                io.Latent.Input("end_frame_latent", optional=True),
-                io.Float.Input("end_frame_fill", default=1.0, min=0.0, max=1.0, step=0.01, tooltip="Percentage of padding frames to blend end_samples into. 0.5 = last 50% of padding, 1.0 = entire padding"),
-                io.Float.Input("end_frame_max_strength", default=0.5, min=0.0, max=1.0, step=0.01, tooltip="Maximum blend strength for end_samples. 1.0 = 100% end_samples at final frame, 0.5 = 50% max blend"),
+                io.Latent.Input("end_samples", optional=True),
             ],
             outputs=[
                 io.Conditioning.Output(display_name="positive"),
@@ -3130,7 +3128,7 @@ class WanImageToVideoSVIPro(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, positive, negative, length, motion_latent_count, anchor_samples, end_frame_fill=0.5, end_frame_max_strength=1.0, prev_samples=None, end_frame_latent=None) -> io.NodeOutput:
+    def execute(cls, positive, negative, length, motion_latent_count, anchor_samples, prev_samples=None, end_samples=None) -> io.NodeOutput:
 
         latent_total = (length - 1) // 4 + 1
 
@@ -3161,9 +3159,9 @@ class WanImageToVideoSVIPro(io.ComfyNode):
             # mask[:, fw_offset:target] = 0.0
             fw_offset = target
 
-        # closing with end_frame_latent if provided
-        if end_frame_latent is not None:
-            end_latent = end_frame_latent["samples"]
+        # closing with end_samples if provided
+        if end_samples is not None:
+            end_latent = end_samples["samples"]
             end_latent_count = end_latent.shape[2]
 
             if 0 < end_latent_count:
