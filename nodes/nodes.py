@@ -3141,14 +3141,14 @@ class WanImageToVideoSVIPro(io.ComfyNode):
 
         # allocate cat concat latent and mask
         cat_latent = torch.zeros(batch, ch, latent_total, height, width, dtype=dtype, device=device)
-        mask = torch.ones((1, latent_total, 4, height, width), device=device, dtype=dtype)
+        mask = torch.ones((1, 1, latent_total * 4, height, width), device=device, dtype=dtype)
         fw_offset = 0
         bw_offset = latent_total
 
         # accumulate anchor latents
         fw_offset += anchor_length
         cat_latent[:, :, :fw_offset] = anchor_latent
-        mask[:, :fw_offset] = 0.0
+        mask[:, :, :4 * fw_offset] = 0.0
 
         # apply motion latents from prev_samples if provided
         if prev_samples is not None and  0 < motion_latent_count:
@@ -3156,7 +3156,7 @@ class WanImageToVideoSVIPro(io.ComfyNode):
 
             target = fw_offset + motion_latent_count
             cat_latent[:, :, fw_offset:target] = motion_latent
-            # mask[:, fw_offset:target] = 0.0
+            # mask[:, :, 4 * fw_offset:4 * target] = 0.0
             fw_offset = target
 
         # closing with end_samples if provided
@@ -3166,13 +3166,15 @@ class WanImageToVideoSVIPro(io.ComfyNode):
 
             if 0 < end_latent_count:
                 bw_offset -= end_latent_count
-                # latents_mean = comfy.latent_formats.Wan21().latents_mean.to(device=device, dtype=dtype)
-                # cat_latent[:, :, bw_offset:] = end_latent
+                latents_mean = comfy.latent_formats.Wan21().latents_mean.to(device=device, dtype=dtype)
+                latents_std = comfy.latent_formats.Wan21().latents_std.to(device=device, dtype=dtype)
+                # cat_latent[:, :, bw_offset:] = end_latent - latents_mean
                 cat_latent[:, :, bw_offset:] = comfy.latent_formats.Wan21().process_out(end_latent)
-                mask[:, bw_offset:] = 0.0
+                mask[:, :, 4 * bw_offset + 3:] = 0.0
 
+        # cat_latent[:, :, fw_offset:] = comfy.latent_formats.Wan21().process_out(cat_latent[:, :, fw_offset:])
         cat_latent[:, :, fw_offset:bw_offset] = comfy.latent_formats.Wan21().process_out(cat_latent[:, :, fw_offset:bw_offset])
-        mask = mask.transpose(1, 2)
+        mask = mask.view(1, mask.shape[2] // 4, 4, mask.shape[3], mask.shape[4]).transpose(1, 2)
 
         positive = node_helpers.conditioning_set_values(positive, {"concat_latent_image": cat_latent, "concat_mask": mask})
         negative = node_helpers.conditioning_set_values(negative, {"concat_latent_image": cat_latent, "concat_mask": mask})
