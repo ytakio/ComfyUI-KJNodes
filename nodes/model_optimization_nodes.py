@@ -1,19 +1,17 @@
 import os
-from comfy.ldm.modules import attention as comfy_attention
 import logging
 import torch
 import importlib
 import math
 import datetime
+from tqdm import tqdm
 
 import folder_paths
 import comfy.model_management as mm
 from comfy.cli_args import args
 from comfy.ldm.modules.attention import wrap_attn, optimized_attention
-import comfy.model_patcher
 import comfy.utils
 import comfy.sd
-
 
 try:
     from comfy_api.latest import io
@@ -23,20 +21,6 @@ except ImportError:
     logging.warning("ComfyUI v3 node API not available, please update ComfyUI to access latest v3 nodes.")
 
 sageattn_modes = ["disabled", "auto", "sageattn_qk_int8_pv_fp16_cuda", "sageattn_qk_int8_pv_fp16_triton", "sageattn_qk_int8_pv_fp8_cuda", "sageattn_qk_int8_pv_fp8_cuda++", "sageattn3", "sageattn3_per_block_mean"]
-
-_initialized = False
-_original_functions = {}
-
-if not _initialized:
-    _original_functions["orig_attention"] = comfy_attention.optimized_attention
-    _original_functions["original_patch_model"] = comfy.model_patcher.ModelPatcher.patch_model
-    _original_functions["original_load_lora_for_models"] = comfy.sd.load_lora_for_models
-    try:
-        _original_functions["original_qwen_forward"] = comfy.ldm.qwen_image.model.Attention.forward
-    except:
-        pass
-    _initialized = True
-
 
 def get_sage_func(sage_attention, allow_compile=False):
     logging.info(f"Using sage attention mode: {sage_attention}")
@@ -159,7 +143,7 @@ class CheckpointLoaderKJ():
     FUNCTION = "load"
     DESCRIPTION = "Experimental node for patching torch.nn.Linear with CublasLinear."
     EXPERIMENTAL = True
-    CATEGORY = "KJNodes/experimental"
+    CATEGORY = "KJNodes/model_loaders"
 
     def load(self, ckpt_name, weight_dtype, compute_dtype, patch_cublaslinear, sage_attention, enable_fp16_accumulation):
         DTYPE_MAP = {
@@ -222,8 +206,10 @@ class CheckpointLoaderKJ():
 class DiffusionModelSelector():
     @classmethod
     def INPUT_TYPES(s):
+        ltx2_connector_models = folder_paths.get_filename_list("text_encoders")
+        ltx2_connector_models = [m for m in ltx2_connector_models if "connector" in m.lower()]
         return {"required": {
-            "model_name": (folder_paths.get_filename_list("diffusion_models"), {"tooltip": "The name of the checkpoint (model) to load."}),
+            "model_name": (folder_paths.get_filename_list("diffusion_models") + ltx2_connector_models, {"tooltip": "The name of the checkpoint (model) to load."}),
         },
         }
 
@@ -232,10 +218,13 @@ class DiffusionModelSelector():
     FUNCTION = "get_path"
     DESCRIPTION = "Returns the path to the model as a string."
     EXPERIMENTAL = True
-    CATEGORY = "KJNodes/experimental"
+    CATEGORY = "KJNodes/model_loaders"
 
     def get_path(self, model_name):
-        model_path = folder_paths.get_full_path_or_raise("diffusion_models", model_name)
+        if "connector" in model_name.lower():
+            model_path = folder_paths.get_full_path_or_raise("text_encoders", model_name)
+        else:
+            model_path = folder_paths.get_full_path_or_raise("diffusion_models", model_name)
         return (model_path,)
 
 class DiffusionModelLoaderKJ():
@@ -258,7 +247,7 @@ class DiffusionModelLoaderKJ():
     FUNCTION = "patch_and_load"
     DESCRIPTION = "Node for patching torch.nn.Linear with CublasLinear."
     EXPERIMENTAL = True
-    CATEGORY = "KJNodes/experimental"
+    CATEGORY = "KJNodes/model_loaders"
 
     def patch_and_load(self, model_name, weight_dtype, compute_dtype, patch_cublaslinear, sage_attention, enable_fp16_accumulation, extra_state_dict=None):
         DTYPE_MAP = {
@@ -295,17 +284,12 @@ class DiffusionModelLoaderKJ():
 
         sd, metadata = comfy.utils.load_torch_file(unet_path, return_metadata=True)
         if extra_state_dict is not None:
-            # If the model is a checkpoint, strip additional non-diffusion model entries before adding extra state dict
-            from comfy import model_detection
-            diffusion_model_prefix = model_detection.unet_prefix_from_state_dict(sd)
-            if diffusion_model_prefix == "model.diffusion_model.":
-                temp_sd = comfy.utils.state_dict_prefix_replace(sd, {diffusion_model_prefix: ""}, filter_keys=True)
-                if len(temp_sd) > 0:
-                    sd = temp_sd
-
             extra_sd = comfy.utils.load_torch_file(extra_state_dict)
             sd.update(extra_sd)
             del extra_sd
+
+            diffusion_model_prefix = comfy.sd.model_detection.unet_prefix_from_state_dict(sd)
+            sd = comfy.utils.state_dict_prefix_replace(sd, {diffusion_model_prefix: ""}, filter_keys=False)
 
         model = comfy.sd.load_diffusion_model_state_dict(sd, model_options=model_options, metadata=metadata)
         if dtype := DTYPE_MAP.get(compute_dtype):
@@ -372,7 +356,7 @@ class PatchModelPatcherOrder:
                 }}
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "patch"
-    CATEGORY = "KJNodes/experimental"
+    CATEGORY = "KJNodes/deprecated"
     DESCRIPTION = "NO LONGER NECESSARY OR FUNCTIONAL, keeping node for backwards compatibility. Use the TorchCompileModelAdvanced to use LoRA with torch.compile."
     DEPRECATED = True
 
@@ -497,6 +481,9 @@ class TorchCompileModelAdvanced:
                 "dynamo_cache_size_limit": ("INT", {"default": 64, "min": 0, "max": 1024, "step": 1, "tooltip": "torch._dynamo.config.cache_size_limit"}),
                 "debug_compile_keys": ("BOOLEAN", {"default": False, "tooltip": "Print the compile keys used for torch.compile"}),
             },
+            "optional": {
+                "disable_dynamic_vram": ("BOOLEAN", {"default": False, "tooltip": "Disable dynamic VRAM feature as it can cause issues with compile"}),
+            }
         }
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "patch"
@@ -504,11 +491,19 @@ class TorchCompileModelAdvanced:
     DESCRIPTION = "Advanced torch.compile patching for diffusion models."
     EXPERIMENTAL = True
 
-    def patch(self, model, backend, fullgraph, mode, dynamic, dynamo_cache_size_limit, compile_transformer_blocks_only, debug_compile_keys):
+    def patch(self, model, backend, fullgraph, mode, dynamic, dynamo_cache_size_limit, compile_transformer_blocks_only, debug_compile_keys, disable_dynamic_vram=False):
         from comfy_api.torch_helpers import set_torch_compile_wrapper
-        m = model.clone()
+        if disable_dynamic_vram:
+            try:
+                m = model.clone(disable_dynamic=True)
+            except TypeError:
+                logging.warning("This ComfyUI version do not support disabling dynamic VRAM through a node. This may cause issues with torch.compile.")
+                m = model.clone()
+        else:
+            m = model.clone()
+
         diffusion_model = m.get_model_object("diffusion_model")
-        torch._dynamo.config.cache_size_limit = dynamo_cache_size_limit   
+        torch._dynamo.config.cache_size_limit = dynamo_cache_size_limit
 
         try:
             if compile_transformer_blocks_only:
@@ -534,7 +529,7 @@ class TorchCompileModelAdvanced:
             except KeyError:
                 raise ValueError(f"Invalid dynamic arg {dynamic}")
 
-            set_torch_compile_wrapper(model=m, keys=compile_key_list, backend=backend, mode=mode, dynamic=dynamic, fullgraph=fullgraph)           
+            set_torch_compile_wrapper(model=m, keys=compile_key_list, backend=backend, mode=mode, dynamic=dynamic, fullgraph=fullgraph)
         except:
             raise RuntimeError("Failed to compile model")
 
@@ -685,9 +680,8 @@ try:
     from comfy.ldm.wan.model import sinusoidal_embedding_1d
 except:
     pass
-from einops import repeat
+
 from unittest.mock import patch
-from contextlib import nullcontext
 import numpy as np
 
 def relative_l1_distance(last_tensor, current_tensor):
@@ -885,7 +879,7 @@ class WanVideoTeaCacheKJ:
     RETURN_TYPES = ("MODEL",)
     RETURN_NAMES = ("model",)
     FUNCTION = "patch_teacache"
-    CATEGORY = "KJNodes/teacache"
+    CATEGORY = "KJNodes/deprecated"
     DEPRECATED = True
     DESCRIPTION = """
 Patch WanVideo model to use TeaCache. Speeds up inference by caching the output and  
@@ -1132,7 +1126,7 @@ class WanVideoEnhanceAVideoKJ:
     RETURN_TYPES = ("MODEL",)
     RETURN_NAMES = ("model",)
     FUNCTION = "enhance"
-    CATEGORY = "KJNodes/experimental"
+    CATEGORY = "KJNodes/wan"
     DESCRIPTION = "https://github.com/NUS-HPC-AI-Lab/Enhance-A-Video"
     EXPERIMENTAL = True
 
@@ -1213,7 +1207,7 @@ class LTXVEnhanceAVideoKJ:
     RETURN_TYPES = ("MODEL",)
     RETURN_NAMES = ("model",)
     FUNCTION = "enhance"
-    CATEGORY = "KJNodes/experimental"
+    CATEGORY = "KJNodes/ltxv"
     DESCRIPTION = "https://github.com/NUS-HPC-AI-Lab/Enhance-A-Video"
     EXPERIMENTAL = True
 
@@ -1395,7 +1389,7 @@ class WanVideoNAG:
     RETURN_TYPES = ("MODEL",)
     RETURN_NAMES = ("model",)
     FUNCTION = "patch"
-    CATEGORY = "KJNodes/experimental"
+    CATEGORY = "KJNodes/wan"
     DESCRIPTION = "https://github.com/ChenDarYen/Normalized-Attention-Guidance"
     EXPERIMENTAL = True
 
@@ -1560,17 +1554,20 @@ class GGUFLoaderKJ(io.ComfyNode):
         # Get GGUF models safely, fallback to empty list if unet_gguf folder doesn't exist
         try:
             gguf_models = folder_paths.get_filename_list("unet_gguf")
+            ltx2_connector_models = folder_paths.get_filename_list("text_encoders")
+            ltx2_connector_models = [m for m in ltx2_connector_models if "connector" in m.lower()]
         except KeyError:
             gguf_models = []
+            ltx2_connector_models = []
 
         return io.Schema(
             node_id="GGUFLoaderKJ",
-            category="KJNodes/experimental",
+            category="KJNodes/model_loaders",
             description="Loads a GGUF model with advanced options, requires [ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF) to be installed.",
             is_experimental=True,
             inputs=[
                 io.Combo.Input("model_name", options=gguf_models),
-                io.Combo.Input("extra_model_name", options=gguf_models + ["none"], default="none", tooltip="An extra gguf model to load and merge into the main model, for example VACE module"),
+                io.Combo.Input("extra_model_name", options=gguf_models + ltx2_connector_models + ["none"], default="none", tooltip="An extra gguf model to load and merge into the main model, for example VACE module"),
                 io.Combo.Input("dequant_dtype", options=["default", "target", "float32", "float16", "bfloat16"], default="default"),
                 io.Combo.Input("patch_dtype", options=["default", "target", "float32", "float16", "bfloat16"], default="default"),
                 io.Boolean.Input("patch_on_device", default=False),
@@ -1643,10 +1640,19 @@ class GGUFLoaderKJ(io.ComfyNode):
             sd = gguf_nodes.loader.gguf_sd_loader(model_path)
 
         if extra_model_name is not None and extra_model_name != "none":
-            if not extra_model_name.endswith(".gguf"):
+            if extra_model_name.endswith(".gguf"):
+                extra_model_full_path = folder_paths.get_full_path("unet", extra_model_name)
+                extra_model = gguf_nodes.loader.gguf_sd_loader(extra_model_full_path)
+            elif "connector" in extra_model_name.lower():
+                extra_model_full_path = folder_paths.get_full_path("text_encoders", extra_model_name)
+                extra_model = comfy.utils.load_torch_file(extra_model_full_path)
+                diffusion_model_prefix = comfy.model_detection.unet_prefix_from_state_dict(extra_model)
+                if diffusion_model_prefix == "model.diffusion_model.":
+                    temp_sd = comfy.utils.state_dict_prefix_replace(extra_model, {diffusion_model_prefix: ""}, filter_keys=True)
+                    if len(temp_sd) > 0:
+                        extra_model = temp_sd
+            else:
                 raise ValueError("Extra model must also be a .gguf file")
-            extra_model_full_path = folder_paths.get_full_path("unet", extra_model_name)
-            extra_model = gguf_nodes.loader.gguf_sd_loader(extra_model_full_path)
             sd.update(extra_model)
 
         model = comfy.sd.load_diffusion_model_state_dict(
@@ -1816,7 +1822,7 @@ class StartRecordCUDAMemoryHistory():
     RETURN_TYPES = (IO.ANY, )
     RETURN_NAMES = ("input", "output_path",)
     FUNCTION = "start"
-    CATEGORY = "KJNodes/experimental"
+    CATEGORY = "KJNodes/memory"
     DESCRIPTION = "THIS NODE ALWAYS RUNS. Starts recording CUDA memory allocation history, can be ended and saved with EndRecordCUDAMemoryHistory. "
 
     def start(self, input, enabled, context, stacks, max_entries):
@@ -1842,7 +1848,7 @@ class EndRecordCUDAMemoryHistory():
     RETURN_TYPES = (IO.ANY, "STRING",)
     RETURN_NAMES = ("input", "output_path",)
     FUNCTION = "end"
-    CATEGORY = "KJNodes/experimental"
+    CATEGORY = "KJNodes/memory"
     DESCRIPTION = "Records CUDA memory allocation history between start and end, saves to a file that can be analyzed here: https://docs.pytorch.org/memory_viz or with VisualizeCUDAMemoryHistory node"
 
     def end(self, input, output_path):
@@ -1873,7 +1879,7 @@ class VisualizeCUDAMemoryHistory():
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("output_path",)
     FUNCTION = "visualize"
-    CATEGORY = "KJNodes/experimental"
+    CATEGORY = "KJNodes/memory"
     DESCRIPTION = "Visualizes a CUDA memory allocation history file, opens in browser"
     OUTPUT_NODE = True
 
@@ -1922,7 +1928,7 @@ class ModelMemoryUseReportPatch:
     FUNCTION = "patch"
     DESCRIPTION = "Adds callbacks to model to report memory usage during after sampling"
     EXPERIMENTAL = True
-    CATEGORY = "KJNodes/experimental"
+    CATEGORY = "KJNodes/memory"
 
     def patch(self, model):
         model_clone = model.clone()
@@ -1970,7 +1976,7 @@ class ModelMemoryUsageFactorOverride:
     FUNCTION = "patch"
     DESCRIPTION = "Overrides the memory usage factor of the model during sampling."
     EXPERIMENTAL = True
-    CATEGORY = "KJNodes/experimental"
+    CATEGORY = "KJNodes/memory"
 
     def patch(self, model, memory_usage_factor):
         model_clone = model.clone()
@@ -2044,7 +2050,7 @@ class WanChunkFeedForward(io.ComfyNode):
 
 from comfy.samplers import KSAMPLER
 from comfy.k_diffusion.sampling import to_d
-from tqdm import tqdm
+
 def sample_selfrefinevideo(model, x, sigmas, stochastic_step_map, certain_percentage=0.999, uncertainty_threshold=0.25, extra_args=None, callback=None, disable=None, verbose=False, video_shape=None, seed=None):
     extra_args = {} if extra_args is None else extra_args
     sigma_in = x.new_ones([x.shape[0]])
