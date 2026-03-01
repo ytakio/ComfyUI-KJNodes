@@ -3130,58 +3130,66 @@ class WanImageToVideoSVIPro(io.ComfyNode):
 
     @classmethod
     def execute(cls, positive, negative, length, motion_latent_count, anchor_samples, prev_samples=None, end_samples=None) -> io.NodeOutput:
-
-        latent_total = (length - 1) // 4 + 1
-
         anchor_latent = anchor_samples["samples"]
+        total_latents = (length - 1) // 4 + 1
+
+        batch, ch, anchor_length, height, width = anchor_latent.shape
         device = anchor_latent.device
         dtype = anchor_latent.dtype
-        batch, ch, anchor_length, height, width = anchor_latent.shape
 
-        empty_latent = torch.zeros([batch, ch, latent_total, height, width], device=model_management.intermediate_device())
+        # make empty_latent on same device/dtype as anchor_latent
+        empty_latent = torch.zeros([batch, ch, total_latents, height, width], device=device, dtype=dtype)
 
-        # allocate cat concat latent and mask
-        cat_latent = torch.zeros(batch, ch, latent_total, height, width, dtype=dtype, device=device)
-        mask = torch.ones((1, 1, latent_total * 4, height, width), device=device, dtype=dtype)
+        # prepare image_cond_latent / mask on same device/dtype
+        image_cond_latent = torch.zeros(batch, ch, total_latents, height, width, dtype=dtype, device=device)
+        mask = torch.ones((1, 1, total_latents * 4, height, width), device=device, dtype=dtype)
         fw_offset = 0
-        bw_offset = latent_total
+        bw_offset = total_latents
 
-        # accumulate anchor latents
-        fw_offset += anchor_length
-        cat_latent[:, :, :fw_offset] = anchor_latent
-        mask[:, :, :4 * fw_offset] = 0.0
+        # --- cache a Wan21 instance and move its mean/std once ---
+        wan = comfy.latent_formats.Wan21()
+        wan.latents_mean = wan.latents_mean.to(device=device, dtype=dtype)
+        wan.latents_std = wan.latents_std.to(device=device, dtype=dtype)
 
-        # apply motion latents from prev_samples if provided
-        if prev_samples is not None and  0 < motion_latent_count:
-            motion_latent = prev_samples["samples"][:, :, -motion_latent_count:]
+        # If you don't need gradients for these ops, avoid autograd overhead
+        with torch.no_grad():
+            # accumulate anchor latents
+            fw_offset += anchor_length
+            image_cond_latent[:, :, :fw_offset] = anchor_latent
+            mask[:, :, :4 * fw_offset] = 0.0
 
-            target = fw_offset + motion_latent_count
-            cat_latent[:, :, fw_offset:target] = motion_latent
-            # mask[:, :, 4 * fw_offset:4 * target] = 0.0
-            fw_offset = target
+            # apply motion latents from prev_samples if provided
+            if prev_samples is not None and 0 < motion_latent_count:
+                motion_latent = prev_samples["samples"][:, :, -motion_latent_count:]
+                # ensure motion_latent is on same device/dtype to avoid implicit transfer
+                if motion_latent.device != device or motion_latent.dtype != dtype:
+                    motion_latent = motion_latent.to(device=device, dtype=dtype)
+                target = fw_offset + motion_latent_count
+                image_cond_latent[:, :, fw_offset:target] = motion_latent
+                fw_offset = target
 
-        # closing with end_samples if provided
-        if end_samples is not None:
-            end_latent = end_samples["samples"]
-            end_latent_count = end_latent.shape[2]
+            # closing with end_samples if provided
+            if end_samples is not None:
+                end_latent = end_samples["samples"]
+                end_latent_count = end_latent.shape[2]
+                if 0 < end_latent_count:
+                    bw_offset -= end_latent_count
+                    # use cached wan (mean/std already moved)
+                    image_cond_latent[:, :, bw_offset:] = wan.process_out(end_latent.to(device=device, dtype=dtype))
+                    mask[:, :, 4 * bw_offset + 3:] = 0.0
 
-            if 0 < end_latent_count:
-                bw_offset -= end_latent_count
-                latents_mean = comfy.latent_formats.Wan21().latents_mean.to(device=device, dtype=dtype)
-                latents_std = comfy.latent_formats.Wan21().latents_std.to(device=device, dtype=dtype)
-                # cat_latent[:, :, bw_offset:] = end_latent - latents_mean
-                cat_latent[:, :, bw_offset:] = comfy.latent_formats.Wan21().process_out(end_latent)
-                mask[:, :, 4 * bw_offset + 3:] = 0.0
+            # main processing: avoid recreating Wan21() here
+            if fw_offset < bw_offset:
+                src_slice = image_cond_latent[:, :, fw_offset:bw_offset]
+                image_cond_latent[:, :, fw_offset:bw_offset] = wan.process_out(src_slice)
 
-        # cat_latent[:, :, fw_offset:] = comfy.latent_formats.Wan21().process_out(cat_latent[:, :, fw_offset:])
-        cat_latent[:, :, fw_offset:bw_offset] = comfy.latent_formats.Wan21().process_out(cat_latent[:, :, fw_offset:bw_offset])
+        # finalize mask layout
         mask = mask.view(1, mask.shape[2] // 4, 4, mask.shape[3], mask.shape[4]).transpose(1, 2)
 
-        positive = node_helpers.conditioning_set_values(positive, {"concat_latent_image": cat_latent, "concat_mask": mask})
-        negative = node_helpers.conditioning_set_values(negative, {"concat_latent_image": cat_latent, "concat_mask": mask})
+        positive = node_helpers.conditioning_set_values(positive, {"concat_latent_image": image_cond_latent, "concat_mask": mask})
+        negative = node_helpers.conditioning_set_values(negative, {"concat_latent_image": image_cond_latent, "concat_mask": mask})
 
-        out_latent = {}
-        out_latent["samples"] = empty_latent
+        out_latent = {"samples": empty_latent}
         return io.NodeOutput(positive, negative, out_latent)
 
 class DeprecatedCompileNodeKJ:
